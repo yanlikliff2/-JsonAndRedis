@@ -1,0 +1,149 @@
+using System;
+using Newtonsoft.Json;
+using System.IO;
+using System.Text.Json;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Npgsql;
+using StackExchange.Redis;
+using System.Text.Json.Serialization;
+
+namespace JsonReader
+{
+
+    public class User
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public string Email { get; set; }
+        public int Age { get; set; }
+        public bool IsActive { get; set; }
+    }
+
+    public class ForRedis
+    {
+        private ConnectionMultiplexer redis = ConnectionMultiplexer.Connect("localhost:6379");
+        private IDatabase db;
+
+        public ForRedis()
+        {
+            db = redis.GetDatabase();
+        }
+
+        public async Task InsertIntoTable(string key, string value)
+        {
+            await db.StringSetAsync(key, value);
+        }
+
+        public async Task<string> Read(string key)
+        {
+            return await db.StringGetAsync(key);
+        }
+    }
+
+    public class FileJsonStrategy : IReadJson
+    {
+        public async Task<User[]> AsyncRead(string path)
+        {
+            using (StreamReader reader = new StreamReader(path))
+            {
+                string content = await reader.ReadToEndAsync();
+                Console.WriteLine("Файл прочитан через StreamReader.");
+                User[] users = JsonConvert.DeserializeObject<User[]>(content);
+                return users;
+            }
+        }
+    }
+
+    public class WorkPostgres
+    {
+        private const string Connection = "Host=localhost;Port=5438;Username=postgres;Password=12345;Database=postgres";
+
+        public async Task CreateTable()
+        {
+            using (var connection = new NpgsqlConnection(Connection))
+            {
+                await connection.OpenAsync();
+                var command = new NpgsqlCommand(@"CREATE TABLE IF NOT EXISTS Users (
+                    Id SERIAL PRIMARY KEY,
+                    Name TEXT NOT NULL,
+                    Email TEXT NOT NULL,
+                    Age INT,
+                    IsActive BOOLEAN
+                )", connection);
+                await command.ExecuteNonQueryAsync();
+            }
+        }
+
+        public async Task InsertIntoTable(int id, string name, string email, int age, bool isActive)
+        {
+            using (var connection = new NpgsqlConnection(Connection))
+            {
+                await connection.OpenAsync();
+                var command = new NpgsqlCommand(
+                    @"INSERT INTO Users (Id, Name, Email, Age, IsActive) VALUES (@id, @name, @email, @age, @isActive)",
+                    connection);
+                command.Parameters.AddWithValue("id", id);
+                command.Parameters.AddWithValue("name", name);
+                command.Parameters.AddWithValue("email", email);
+                command.Parameters.AddWithValue("age", age);
+                command.Parameters.AddWithValue("isActive", isActive);
+                await command.ExecuteNonQueryAsync();
+            }
+        }
+    }
+
+
+    public class DelegateForJSON
+    {
+        public event Func<User[], Task> DataRead;
+
+        public async Task Read(string path, IReadJson strat)
+        {
+            User[] users = await strat.AsyncRead(path);
+            if (DataRead != null)
+                await DataRead(users);
+        }
+    }
+
+    public interface IReadJson
+    {
+        Task<User[]> AsyncRead(string path);
+    }
+
+    internal class Program
+    {
+
+        static async Task Main(string[] args)
+        {
+            Console.WriteLine("Введите путь к файлу .json:");
+            string pathToFile = Console.ReadLine();
+            var p = new WorkPostgres();
+            var r = new ForRedis();
+            await p.CreateTable();
+            try
+            {
+                var reader = new DelegateForJSON();
+                reader.DataRead += async (users) =>
+                {
+                    foreach (var user in users)
+                    {
+                        await p.InsertIntoTable(user.Id, user.Name, user.Email, user.Age, user.IsActive);
+                        await r.InsertIntoTable("Last", JsonConvert.SerializeObject(user));
+                    }
+                    Console.WriteLine("Запись прошла успешно.");
+                };
+                IReadJson strategy = new FileJsonStrategy();
+                await reader.Read(pathToFile, strategy);
+                string lastUser = await r.Read("Last");
+                Console.WriteLine($"Последняя запись в Redis: {lastUser}");
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e.ToString());
+            }
+        }
+    }
+}
